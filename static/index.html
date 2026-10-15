@@ -1,0 +1,767 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>git-diff-server</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --panel: #f6f8fa; --border: #d0d7de;
+    --hover: #eaeef2; --sel: #ddf4ff; --sel-fg: #0969da; --input: #ffffff;
+    --add: #dafbe1; --addw: #aceebb; --del: #ffebe9; --delw: #ffcecb; --empty: #f6f8fa;
+    --gone: #cf222e; --L: #bf8700; --R: #0969da; --bar: #8c959f; --git: #1a7f37;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --panel: #161b22; --border: #30363d;
+      --hover: #1f262e; --sel: #1f3a5f; --sel-fg: #79c0ff; --input: #0d1117;
+      --add: #12261e; --addw: #1f6f3b; --del: #2d1517; --delw: #8e2a2e; --empty: #161b22;
+      --gone: #ff7b72; --L: #d29922; --R: #58a6ff; --bar: #6e7681; --git: #3fb950;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: var(--bg); color: var(--fg);
+         font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  button, input { font: inherit; color: inherit; }
+  button { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+  button:hover { background: var(--hover); }
+  button.primary { background: var(--sel-fg); border-color: var(--sel-fg); color: #fff; }
+  input[type=text] { background: var(--input); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; width: 100%; }
+  label.chk { display: inline-flex; gap: 5px; align-items: center; white-space: nowrap; cursor: pointer; user-select: none; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); }
+
+  header { display: flex; gap: 12px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  header .file { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .badge { font-size: 11px; padding: 0 6px; border-radius: 9px; border: 1px solid currentColor; margin-left: 6px; font-family: system-ui, sans-serif; }
+  .badge.gone { color: var(--gone); }
+
+  .layout { flex: 1; display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
+  aside { display: flex; flex-direction: column; border-right: 1px solid var(--border); min-height: 0; }
+  aside .controls { padding: 8px; display: grid; gap: 6px; border-bottom: 1px solid var(--border); }
+  #tree { flex: 1; overflow: auto; padding: 4px 0; font-family: var(--mono); font-size: 12px; }
+  .item { padding: 1px 8px; white-space: nowrap; cursor: pointer; overflow: hidden; text-overflow: ellipsis; }
+  .item:hover { background: var(--hover); }
+  .item.sel { background: var(--sel); color: var(--sel-fg); }
+  .item.gone { color: var(--gone); text-decoration: line-through; }
+  .item.disabled { opacity: .4; cursor: not-allowed; }
+  .item .twisty { display: inline-block; width: 1.2em; color: var(--muted); }
+  .item .note { font-family: system-ui, sans-serif; font-size: 11px; color: var(--muted); margin-left: 6px; text-decoration: none; display: inline-block; }
+  #tree .msg { padding: 8px; color: var(--muted); font-family: system-ui, sans-serif; }
+  #changes { max-height: 30%; overflow: auto; border-top: 1px solid var(--border); padding: 6px 8px; font-size: 12px; }
+  #changes h3 { margin: 0 0 4px; font-size: 12px; color: var(--muted); }
+  #changes .g { display: flex; gap: 8px; justify-content: space-between; cursor: pointer; padding: 1px 4px; border-radius: 4px; }
+  #changes .g:hover { background: var(--hover); }
+  #changes .g span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plus { color: var(--git); } .minus { color: var(--gone); }
+
+  section.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 8px 10px 4px; gap: 0; }
+  .msgs { display: grid; grid-template-columns: 1fr 1fr; }
+  .msgbox { border: 1px solid var(--border); border-top: 3px solid; padding: 4px 8px; background: var(--panel); min-width: 0; }
+  .msgbox.l { border-top-color: var(--L); border-right: 0; border-radius: 6px 0 0 0; }
+  .msgbox.r { border-top-color: var(--R); border-radius: 0 6px 0 0; }
+  .msgbox .meta { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .msgbox .meta b.l { color: var(--L); } .msgbox .meta b.r { color: var(--R); }
+  .msgbox pre { margin: 2px 0 0; font: 12px/16px var(--mono); height: 80px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+
+  #diff { flex: 1; overflow: auto; border: 1px solid var(--border); border-top: 0; border-radius: 0 0 6px 6px; font: 12px/18px var(--mono); min-height: 0; }
+  #diff .placeholder { padding: 24px; color: var(--muted); font-family: system-ui, sans-serif; font-size: 14px; }
+  .row { display: grid; grid-template-columns: var(--nw, 4ch) minmax(0, 1fr) var(--nw, 4ch) minmax(0, 1fr); }
+  .row > span { white-space: pre-wrap; word-break: break-all; min-height: 18px; }
+  .row .n { text-align: right; padding-right: 8px; color: var(--muted); user-select: none; }
+  .row .t { padding-right: 8px; border-right: 1px solid var(--border); }
+  .row .t:last-child { border-right: 0; }
+  .row .d { background: var(--del); } .row .a { background: var(--add); }
+  .row .e { background: var(--empty); }
+  .row .d mark { background: var(--delw); color: inherit; } .row .a mark { background: var(--addw); color: inherit; }
+  .row.k2 .n:first-child, .row.k1 .n:first-child { background: var(--del); }
+  .row.k3 .n:nth-child(3), .row.k1 .n:nth-child(3) { background: var(--add); }
+  .skip { text-align: center; color: var(--muted); background: var(--panel); cursor: pointer; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); font-family: system-ui, sans-serif; font-size: 12px; }
+  .skip:hover { color: var(--fg); }
+  .flash { animation: flash 1s; }
+  @keyframes flash { from { outline: 2px solid var(--sel-fg); } to { outline: 2px solid transparent; } }
+
+  #timeline { overflow-x: auto; overflow-y: hidden; margin-top: 6px; }
+  #tl-inner { position: relative; height: 82px; cursor: pointer; touch-action: none; user-select: none; }
+  #bars { position: absolute; left: 0; right: 0; top: 0; height: 40px; display: flex; gap: 2px; align-items: flex-end; }
+  #bars .bar { flex: 1; min-width: 2px; background: var(--bar); opacity: .45; border-radius: 2px 2px 0 0; }
+  #bars .bar.inr { opacity: .85; }
+  #bars .bar.lsel { background: var(--L); opacity: 1; }
+  #bars .bar.rsel { background: var(--R); opacity: 1; }
+  #bars .bar.wt { background: repeating-linear-gradient(45deg, var(--bar) 0 3px, transparent 3px 6px); opacity: .9; }
+  #bars .bar.wt.rsel { background: repeating-linear-gradient(45deg, var(--R) 0 3px, transparent 3px 6px); }
+  #bars .bar.bin { outline: 1px dashed var(--gone); }
+  #track { position: absolute; left: 0; right: 0; top: 48px; height: 2px; background: var(--border); }
+  #span { position: absolute; top: 47px; height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--L), var(--R)); }
+  .thumb { position: absolute; top: 39px; width: 20px; height: 20px; margin-left: -10px; border-radius: 50%; border: 2px solid var(--bg);
+           display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #000; cursor: grab; z-index: 2; }
+  .thumb.l { background: var(--L); } .thumb.r { background: var(--R); }
+  .lbl { position: absolute; top: 62px; font-size: 11px; color: var(--muted); white-space: nowrap; transform: translateX(-50%); }
+  .lbl.edge-l { transform: none; } .lbl.edge-r { transform: translateX(-100%); }
+
+  #modal { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); display: grid; place-items: center; z-index: 10; }
+  #modal[hidden] { display: none; }
+  .dialog { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; width: min(640px, 92vw); max-height: 80vh;
+            display: flex; flex-direction: column; padding: 14px; gap: 8px; box-shadow: 0 12px 48px rgba(0, 0, 0, .35); }
+  .dialog h2 { margin: 0; font-size: 15px; }
+  .crumbs { font-family: var(--mono); font-size: 12px; }
+  .crumbs a { color: var(--sel-fg); cursor: pointer; text-decoration: none; }
+  .crumbs a:hover { text-decoration: underline; }
+  #dirlist { flex: 1; overflow: auto; border: 1px solid var(--border); border-radius: 6px; min-height: 200px; font-family: var(--mono); font-size: 12px; }
+  #dirlist .item { padding: 3px 8px; }
+  .git { font-family: system-ui, sans-serif; font-size: 10px; padding: 0 6px; border-radius: 8px; background: var(--git); color: #fff; margin-left: 6px; }
+  #recent { font-size: 12px; }
+  #recent a { color: var(--sel-fg); cursor: pointer; margin-right: 10px; font-family: var(--mono); }
+  .dialog .actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+  .dialog .err { color: var(--gone); font-size: 12px; }
+</style>
+<link rel="stylesheet" id="hl-light" media="not all">
+<link rel="stylesheet" id="hl-dark" media="not all">
+</head>
+<body>
+<header>
+  <button id="repo-btn" title="Choose repository">📁 <span id="repo-name">choose repository…</span></button>
+  <span class="file" id="file-label"></span>
+  <label class="chk" title="Syntax highlighting (highlight.js, downloaded once)"><input type="checkbox" id="opt-hl">Syntax highlight</label>
+  <label class="chk"><input type="checkbox" id="opt-word">Word diff</label>
+  <label class="chk" title="Move L and R together"><input type="checkbox" id="opt-lock">Lock gap</label>
+</header>
+
+<div class="layout">
+  <aside>
+    <div class="controls">
+      <input type="text" id="filter" placeholder="filter: text, *.py, bin/**" autocomplete="off" spellcheck="false">
+      <label class="chk"><input type="checkbox" id="opt-deleted">Include deleted files</label>
+    </div>
+    <div id="tree"><div class="msg">Choose a repository to begin.</div></div>
+    <div id="changes" hidden></div>
+  </aside>
+
+  <section class="main">
+    <div class="msgs">
+      <div class="msgbox l"><div class="meta" id="l-meta"><b class="l">L</b></div><pre id="l-msg"></pre></div>
+      <div class="msgbox r"><div class="meta" id="r-meta"><b class="r">R</b></div><pre id="r-msg"></pre></div>
+    </div>
+    <div id="diff"><div class="placeholder">Pick a file from the sidebar.</div></div>
+    <div id="timeline">
+      <div id="tl-inner">
+        <div id="bars"></div>
+        <div id="track"></div>
+        <div id="span"></div>
+        <div class="thumb l" id="thumb-l">L</div>
+        <div class="thumb r" id="thumb-r">R</div>
+        <div id="labels"></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div id="modal" hidden>
+  <div class="dialog">
+    <h2>Choose repository</h2>
+    <div class="crumbs" id="crumbs"></div>
+    <input type="text" id="path-input" placeholder="type a path and press Enter" spellcheck="false" autocomplete="off">
+    <div id="dirlist"></div>
+    <div id="recent"></div>
+    <div class="actions">
+      <span class="err" id="modal-err"></span>
+      <span style="flex:1"></span>
+      <label class="chk"><input type="checkbox" id="opt-hidden">Show hidden</label>
+      <button id="modal-cancel">Cancel</button>
+      <button class="primary" id="modal-open">Open</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const CTX = 3;
+const WORKTREE = "WORKTREE";
+const EQ = 0, CHG = 1, DEL = 2, INS = 3;
+
+const S = {
+  repo: null, files: [], tree: null, file: null, fileInfo: null,
+  commits: [], deleted: null, l: 0, r: 0,
+  expanded: new Set(), diffCache: new Map(), view: null, fetchCtl: null, fetchTimer: null,
+  modalPath: null, modalIsGit: false,
+};
+const opts = JSON.parse(localStorage.getItem("gds-opts") || "{}");
+opts.word ??= true; opts.hl ??= false; opts.lock ??= false; opts.deleted ??= false;
+const saveOpts = () => localStorage.setItem("gds-opts", JSON.stringify(opts));
+
+async function api(name, params = {}, signal) {
+  const res = await fetch(`/api/${name}?` + new URLSearchParams(params), { signal });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const basename = (p) => p.slice(p.lastIndexOf("/") + 1);
+
+// ------------------------------------------------------------------ URL state
+
+function readURL() {
+  const q = new URLSearchParams(location.search);
+  return { repo: q.get("repo"), file: q.get("file"), l: q.get("l"), r: q.get("r") };
+}
+
+function writeURL(push) {
+  const q = new URLSearchParams();
+  if (S.repo) q.set("repo", S.repo.root);
+  if (S.file) q.set("file", S.file);
+  if (S.commits.length) {
+    q.set("l", S.commits[S.l].short);
+    q.set("r", S.commits[S.r].short);
+  }
+  const url = "?" + q.toString().replace(/%2F/g, "/");
+  if (url === location.search) return;
+  push ? history.pushState(null, "", url) : history.replaceState(null, "", url);
+}
+
+window.addEventListener("popstate", () => boot());
+
+// ------------------------------------------------------------- repo + files
+
+async function openRepo(path, push = true) {
+  const info = await api("repo", { path });
+  const changed = !S.repo || S.repo.root !== info.root;
+  S.repo = info;
+  $("repo-name").textContent = info.name + (info.branch ? ` (${info.branch})` : "");
+  $("repo-btn").title = info.root;
+  document.title = `${info.name} · git-diff-server`;
+  if (changed) {
+    S.file = null; S.commits = []; S.expanded = new Set(); S.diffCache.clear();
+    clearFileView();
+  }
+  await loadFiles();
+  if (push) writeURL(true);
+}
+
+async function loadFiles() {
+  $("tree").innerHTML = '<div class="msg">Loading files…</div>';
+  const data = await api("files", { repo: S.repo.root, deleted: opts.deleted ? 1 : 0 });
+  S.files = data.files;
+  S.fileMap = new Map(S.files.map((f) => [f.path, f]));
+  S.tree = buildTree(S.files);
+  renderTree();
+  if (data.error) $("tree").innerHTML = `<div class="msg">${esc(data.error)}</div>`;
+}
+
+function buildTree(files) {
+  const root = { dirs: new Map(), files: [], live: 0 };
+  for (const f of files) {
+    const parts = f.path.split("/");
+    let node = root;
+    if (!f.deleted) node.live++;
+    for (const part of parts.slice(0, -1)) {
+      if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [], live: 0 });
+      node = node.dirs.get(part);
+      if (!f.deleted) node.live++;
+    }
+    node.files.push(f);
+  }
+  return root;
+}
+
+function fileItem(f, depth, label) {
+  const cls = ["item", "file"];
+  if (f.deleted) cls.push("gone");
+  if (f.disabled) cls.push("disabled");
+  if (f.path === S.file) cls.push("sel");
+  let title = f.path;
+  if (f.deleted) title += `\ndeleted ${f.deleted.date} in ${f.deleted.sha.slice(0, 8)}: ${f.deleted.subject}`;
+  if (f.disabled) title += `\n${f.disabled} file (not viewable)`;
+  const note = f.deleted ? `<span class="note">deleted ${esc(f.deleted.date)}</span>` : f.disabled ? `<span class="note">${f.disabled}</span>` : "";
+  return `<div class="${cls.join(" ")}" style="padding-left:${8 + depth * 14}px" data-file="${esc(f.path)}" title="${esc(title)}">` +
+         `<span class="twisty"></span>${esc(label)}${note}</div>`;
+}
+
+function renderTree() {
+  const out = [];
+  const filter = $("filter").value.trim();
+  if (filter) {
+    const match = matcher(filter);
+    let n = 0;
+    for (const f of S.files) {
+      if (!match(f.path)) continue;
+      if (++n > 1000) { out.push('<div class="msg">…more than 1000 matches, refine the filter</div>'); break; }
+      out.push(fileItem(f, 0, f.path));
+    }
+    if (!n) out.push('<div class="msg">No matching files.</div>');
+  } else if (S.tree) {
+    const walk = (node, prefix, depth) => {
+      for (const [name, child] of [...node.dirs].sort((a, b) => a[0].localeCompare(b[0]))) {
+        const path = prefix + name;
+        const open = S.expanded.has(path);
+        out.push(`<div class="item dir${child.live ? "" : " gone"}" style="padding-left:${8 + depth * 14}px" data-dir="${esc(path)}">` +
+                 `<span class="twisty">${open ? "▾" : "▸"}</span>${esc(name)}/</div>`);
+        if (open) walk(child, path + "/", depth + 1);
+      }
+      for (const f of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) out.push(fileItem(f, depth, basename(f.path)));
+    };
+    walk(S.tree, "", 0);
+  }
+  $("tree").innerHTML = out.join("");
+  $("tree").querySelector(".item.sel")?.scrollIntoView({ block: "nearest" });
+}
+
+function matcher(pattern) {
+  if (/[*?]/.test(pattern)) {
+    const rx = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*\*\/?/g, "\0").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]").replace(/\0/g, ".*") + "$", "i");
+    return pattern.includes("/") ? (p) => rx.test(p) : (p) => rx.test(basename(p)) || rx.test(p);
+  }
+  const needle = pattern.toLowerCase();
+  return (p) => p.toLowerCase().includes(needle);
+}
+
+$("tree").addEventListener("click", (e) => {
+  const item = e.target.closest(".item");
+  if (!item) return;
+  if (item.dataset.dir !== undefined) {
+    const d = item.dataset.dir;
+    S.expanded.has(d) ? S.expanded.delete(d) : S.expanded.add(d);
+    renderTree();
+  } else if (item.dataset.file && !item.classList.contains("disabled")) {
+    selectFile(item.dataset.file).catch(showError);
+  }
+});
+
+let filterTimer;
+$("filter").addEventListener("input", () => { clearTimeout(filterTimer); filterTimer = setTimeout(renderTree, 120); });
+
+// ------------------------------------------------------------- file history
+
+function clearFileView() {
+  $("file-label").textContent = "";
+  $("diff").innerHTML = '<div class="placeholder">Pick a file from the sidebar.</div>';
+  $("changes").hidden = true;
+  $("bars").innerHTML = ""; $("labels").innerHTML = "";
+  $("tl-inner").style.visibility = "hidden";
+  for (const s of ["l", "r"]) { $(`${s}-meta`).innerHTML = `<b class="${s}">${s.toUpperCase()}</b>`; $(`${s}-msg`).textContent = ""; }
+}
+
+async function selectFile(path, want = {}, push = true) {
+  S.file = path;
+  S.fileInfo = S.fileMap?.get(path) || null;
+  const parts = path.split("/");
+  for (let i = 1; i < parts.length; i++) S.expanded.add(parts.slice(0, i).join("/"));
+  renderTree();
+  $("file-label").innerHTML = esc(path) + (S.fileInfo?.deleted ? '<span class="badge gone">deleted</span>' : "");
+  $("diff").innerHTML = '<div class="placeholder">Loading history…</div>';
+  const h = await api("history", { repo: S.repo.root, file: path });
+  if (S.file !== path) return;
+  S.commits = h.commits; S.deleted = h.deleted; S.diffCache.clear();
+  if (!S.commits.length) {
+    clearFileView();
+    $("file-label").textContent = path;
+    $("diff").innerHTML = '<div class="placeholder">No history for this file.</div>';
+    return;
+  }
+  const find = (ref) => ref == null ? -1 : S.commits.findIndex((c) => c.short === ref || c.sha.startsWith(ref));
+  const last = S.commits.length - 1;
+  let l = find(want.l), r = find(want.r);
+  if (r < 0) r = last;
+  if (l < 0 || l > r) l = Math.max(0, r - 1);
+  S.l = l; S.r = r;
+  $("tl-inner").style.visibility = "visible";
+  renderBars();
+  update();
+  if (push) writeURL(true);
+}
+
+// ------------------------------------------------------------------ timeline
+
+function renderBars() {
+  const n = S.commits.length;
+  const max = Math.max(1, ...S.commits.map((c) => Math.sqrt(c.add + c.del)));
+  $("tl-inner").style.width = n * 6 > $("timeline").clientWidth ? `${n * 6}px` : "100%";
+  $("bars").innerHTML = S.commits.map((c, i) => {
+    const h = 8 + 92 * Math.sqrt(c.add + c.del) / max;
+    const cls = ["bar", c.sha === WORKTREE ? "wt" : "", c.binary ? "bin" : ""].join(" ");
+    const tip = `${c.short} · ${c.date}${c.author ? " · " + c.author : ""}\n${c.subject}\n+${c.add} −${c.del}${c.path !== S.file ? "\n(as " + c.path + ")" : ""}`;
+    return `<div class="${cls}" data-i="${i}" style="height:${h}%" title="${esc(tip)}"></div>`;
+  }).join("");
+}
+
+function update() {
+  const n = S.commits.length;
+  if (!n) return;
+  const pos = (i) => `${((i + 0.5) / n) * 100}%`;
+  $("thumb-l").style.left = pos(S.l);
+  $("thumb-r").style.left = pos(S.r);
+  $("span").style.left = pos(S.l);
+  $("span").style.width = `${((S.r - S.l) / n) * 100}%`;
+  [...$("bars").children].forEach((b, i) => {
+    b.classList.toggle("lsel", i === S.l);
+    b.classList.toggle("rsel", i === S.r);
+    b.classList.toggle("inr", i > S.l && i < S.r);
+  });
+  const lbl = (i, text) => {
+    const frac = (i + 0.5) / n;
+    const edge = frac < 0.15 ? " edge-l" : frac > 0.85 ? " edge-r" : "";
+    const left = edge === " edge-l" ? "0" : edge ? "100%" : pos(i);
+    return `<div class="lbl${edge}" style="left:${left}">${esc(text)}</div>`;
+  };
+  const day = (c) => c.sha === WORKTREE ? "worktree" : c.date.slice(0, 10);
+  const gap = ((S.r - S.l) / n) * $("tl-inner").clientWidth;
+  if (S.l === S.r) $("labels").innerHTML = lbl(S.l, day(S.commits[S.l]));
+  else if (gap < 160) $("labels").innerHTML = lbl(S.r, `${day(S.commits[S.l])} → ${day(S.commits[S.r])}`);
+  else $("labels").innerHTML = lbl(S.l, day(S.commits[S.l])) + lbl(S.r, day(S.commits[S.r]));
+  renderMsg("l", S.commits[S.l]);
+  renderMsg("r", S.commits[S.r]);
+  writeURL(false);
+  scheduleDiff();
+}
+
+function renderMsg(side, c) {
+  const who = c.sha === WORKTREE ? "working tree" : `<span class="mono">${esc(c.short)}</span> · ${esc(c.date)} · ${esc(c.author)}`;
+  const as = c.path !== S.file ? ` · <span class="mono">${esc(c.path)}</span>` : "";
+  $(`${side}-meta`).innerHTML = `<b class="${side}">${side.toUpperCase()}</b> ${who}${as}`;
+  $(`${side}-meta`).title = c.sha;
+  $(`${side}-msg`).textContent = c.message;
+}
+
+function move(which, idx) {
+  const last = S.commits.length - 1;
+  idx = Math.max(0, Math.min(last, idx));
+  if (opts.lock) {
+    let delta = idx - (which === "l" ? S.l : S.r);
+    delta = Math.max(-S.l, Math.min(last - S.r, delta));
+    S.l += delta; S.r += delta;
+  } else if (which === "l") {
+    S.l = Math.min(idx, S.r);
+  } else {
+    S.r = Math.max(idx, S.l);
+  }
+  update();
+}
+
+function indexAt(clientX) {
+  const rect = $("tl-inner").getBoundingClientRect();
+  const n = S.commits.length;
+  return Math.max(0, Math.min(n - 1, Math.floor(((clientX - rect.left) / rect.width) * n)));
+}
+
+$("tl-inner").addEventListener("pointerdown", (e) => {
+  if (!S.commits.length || e.button !== 0) return;
+  const idx = indexAt(e.clientX);
+  let which;
+  if (e.target.id === "thumb-l") which = "l";
+  else if (e.target.id === "thumb-r") which = "r";
+  else if (e.shiftKey) which = "l";
+  else which = Math.abs(idx - S.l) < Math.abs(idx - S.r) ? "l" : "r";
+  if (!e.target.classList.contains("thumb")) move(which, idx);
+  const el = $("tl-inner");
+  el.setPointerCapture(e.pointerId);
+  const onMove = (ev) => move(which, indexAt(ev.clientX));
+  const onUp = () => { el.removeEventListener("pointermove", onMove); el.removeEventListener("pointerup", onUp); };
+  el.addEventListener("pointermove", onMove);
+  el.addEventListener("pointerup", onUp);
+});
+
+document.addEventListener("keydown", (e) => {
+  if (!$("modal").hidden) { if (e.key === "Escape") closeModal(); return; }
+  if (e.target.matches("input[type=text]") || !S.commits.length) return;
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  e.preventDefault();
+  const d = e.key === "ArrowLeft" ? -1 : 1;
+  e.shiftKey ? move("l", S.l + d) : move("r", S.r + d);
+  const thumb = $(e.shiftKey ? "thumb-l" : "thumb-r");
+  thumb.scrollIntoView({ block: "nearest", inline: "nearest" });
+});
+
+// ---------------------------------------------------------------------- diff
+
+function scheduleDiff() {
+  clearTimeout(S.fetchTimer);
+  S.fetchTimer = setTimeout(() => loadDiff().catch(showError), 90);
+}
+
+async function loadDiff(force = false) {
+  const L = S.commits[S.l], R = S.commits[S.r];
+  const key = `${L.sha}|${R.sha}`;
+  let d = S.diffCache.get(key);
+  if (!d || (force && d.too_large)) {
+    S.fetchCtl?.abort();
+    S.fetchCtl = new AbortController();
+    try {
+      d = await api("diff", { repo: S.repo.root, l: L.sha, lpath: L.path, r: R.sha, rpath: R.path, force: force ? 1 : 0 }, S.fetchCtl.signal);
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      throw err;
+    }
+    S.diffCache.set(key, d);
+  }
+  if (S.commits[S.l] !== L || S.commits[S.r] !== R) return;
+  renderDiff(d, S.l === S.r);
+}
+
+function renderDiff(d, same) {
+  const box = $("diff");
+  $("changes").hidden = true;
+  if (d.lbinary || d.rbinary) {
+    const side = d.lbinary && d.rbinary ? "both sides" : d.lbinary ? "the left side" : "the right side";
+    box.innerHTML = `<div class="placeholder">Binary at this commit (${side}): ${d.lsize} → ${d.rsize} bytes.</div>`;
+    return;
+  }
+  if (d.too_large) {
+    box.innerHTML = `<div class="placeholder">This file is large (${d.llines.toLocaleString()} → ${d.rlines.toLocaleString()} lines). ` +
+                    `<button id="force">Show diff anyway</button></div>`;
+    $("force").onclick = () => loadDiff(true).catch(showError);
+    return;
+  }
+  const rows = d.rows;
+  const lines = { l: [], r: [] };
+  for (const row of rows) { if (row[1] != null) lines.l.push(row[3]); if (row[2] != null) lines.r.push(row[4]); }
+  S.view = { d, rows, hl: highlightFiles(lines) };
+  const digits = String(Math.max(lines.l.length, lines.r.length)).length;
+  box.style.setProperty("--nw", `${digits + 2}ch`);
+
+  const groupAt = new Map(d.groups.map((g, i) => [g[0], i]));
+  const out = [];
+  if (d.labsent || d.rabsent) out.push(`<div class="skip">${d.labsent ? "The file does not exist at L." : ""} ${d.rabsent ? "The file does not exist at R." : ""}</div>`);
+  if (!rows.length) out.push('<div class="skip">(empty file)</div>');
+  let i = 0;
+  while (i < rows.length) {
+    if (rows[i][0] !== EQ || same) { out.push(rowHtml(i, groupAt.get(i))); i++; continue; }
+    let j = i;
+    while (j < rows.length && rows[j][0] === EQ) j++;
+    const head = i === 0 ? 0 : CTX, tail = j === rows.length ? 0 : CTX;
+    if (j - i > head + tail + 1) {
+      for (let k = i; k < i + head; k++) out.push(rowHtml(k));
+      out.push(`<div class="skip" data-from="${i + head}" data-to="${j - tail}">⋯ ${j - tail - i - head} unchanged lines ⋯</div>`);
+      for (let k = j - tail; k < j; k++) out.push(rowHtml(k));
+    } else {
+      for (let k = i; k < j; k++) out.push(rowHtml(k));
+    }
+    i = j;
+  }
+  if (!same && !d.groups.length && rows.length) out.unshift('<div class="skip">No changes between L and R.</div>');
+  const scroll = box.scrollTop;
+  box.innerHTML = out.join("");
+  box.scrollTop = scroll;
+  renderChanges(d);
+}
+
+function rowHtml(i, group) {
+  const [kind, ln, rn, lt, rt, lr, rr] = S.view.rows[i];
+  const lc = kind === DEL || kind === CHG ? "d" : ln == null ? "e" : "";
+  const rc = kind === INS || kind === CHG ? "a" : rn == null ? "e" : "";
+  const id = group != null ? ` id="g${group}"` : "";
+  return `<div class="row k${kind}"${id}><span class="n">${ln ?? ""}</span><span class="t ${lc}">${cell("l", ln, lt, lr)}</span>` +
+         `<span class="n">${rn ?? ""}</span><span class="t ${rc}">${cell("r", rn, rt, rr)}</span></div>`;
+}
+
+function cell(side, no, text, ranges) {
+  if (no == null) return "";
+  const base = S.view.hl ? S.view.hl[side][no - 1] : esc(text);
+  return opts.word && ranges ? overlay(base, ranges) : base;
+}
+
+$("diff").addEventListener("click", (e) => {
+  const skip = e.target.closest(".skip[data-from]");
+  if (!skip) return;
+  const html = [];
+  for (let k = +skip.dataset.from; k < +skip.dataset.to; k++) html.push(rowHtml(k));
+  skip.outerHTML = html.join("");
+});
+
+function renderChanges(d) {
+  const box = $("changes");
+  if (!d.groups.length) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = `<h3>Changes (${d.groups.length}) <span class="plus">+${d.add}</span> <span class="minus">−${d.del}</span></h3>` +
+    d.groups.map((g, i) => `<div class="g" data-g="${i}" title="${esc(g[1])}"><span>${esc(g[1])}</span>` +
+      `<span><span class="plus">+${g[2]}</span> <span class="minus">−${g[3]}</span></span></div>`).join("");
+}
+
+$("changes").addEventListener("click", (e) => {
+  const g = e.target.closest(".g");
+  const row = g && $(`g${g.dataset.g}`);
+  if (!row) return;
+  row.scrollIntoView({ block: "center" });
+  row.classList.remove("flash"); void row.offsetWidth; row.classList.add("flash");
+});
+
+// Wrap character ranges of a line in <mark>, stepping around any HTML tags
+// (from syntax highlighting) and treating entities as single characters.
+function overlay(html, ranges) {
+  ranges = ranges.filter((r) => r[1] > r[0]);
+  if (!ranges.length) return html;
+  let out = "", pos = 0, ri = 0, open = false;
+  for (const t of html.match(/<[^>]*>|&[^;]+;|[^<&]/gsu) || []) {
+    if (t[0] === "<") { out += open ? `</mark>${t}<mark>` : t; continue; }
+    if (!open && ri < ranges.length && pos === ranges[ri][0]) { out += "<mark>"; open = true; }
+    out += t; pos++;
+    if (open && pos === ranges[ri][1]) { out += "</mark>"; open = false; ri++; }
+  }
+  return open ? out + "</mark>" : out;
+}
+
+// ------------------------------------------------------- syntax highlighting
+
+let hljsReady = null;
+function loadHljs() {
+  if (!hljsReady) {
+    hljsReady = new Promise((resolve, reject) => {
+      $("hl-light").href = "/vendor/github.min.css";
+      $("hl-dark").href = "/vendor/github-dark.min.css";
+      const s = document.createElement("script");
+      s.src = "/vendor/highlight.min.js";
+      s.onload = resolve;
+      s.onerror = () => { hljsReady = null; reject(new Error("could not load highlight.js")); };
+      document.head.appendChild(s);
+    });
+  }
+  return hljsReady;
+}
+
+function setHlMedia() {
+  $("hl-light").media = opts.hl ? "(prefers-color-scheme: light)" : "not all";
+  $("hl-dark").media = opts.hl ? "(prefers-color-scheme: dark)" : "not all";
+}
+
+function language(path, firstLine = "") {
+  if (!window.hljs) return null;
+  const name = basename(path);
+  const special = { Makefile: "makefile", Dockerfile: "dockerfile", CMakeLists: "cmake" };
+  if (special[name.split(".")[0]]) return special[name.split(".")[0]];
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  if (ext && hljs.getLanguage(ext)) return ext;
+  if (firstLine.startsWith("#!")) {
+    for (const [word, lang] of [["python", "python"], ["node", "javascript"], ["ruby", "ruby"], ["perl", "perl"], ["sh", "bash"]]) {
+      if (firstLine.includes(word)) return lang;
+    }
+  }
+  return null;
+}
+
+function highlightFiles(lines) {
+  if (!opts.hl || !window.hljs) return null;
+  const lang = language(S.file, lines.r[0] || lines.l[0]);
+  if (!lang) return null;
+  const run = (arr) => splitHighlighted(hljs.highlight(arr.join("\n"), { language: lang, ignoreIllegals: true }).value, arr.length);
+  return { l: run(lines.l), r: run(lines.r) };
+}
+
+// Split highlight.js output into lines, re-opening spans that cross a newline.
+function splitHighlighted(html, count) {
+  const lines = [];
+  const stack = [];
+  let cur = "";
+  for (const t of html.match(/<[^>]*>|[^<]+/g) || []) {
+    if (t[0] === "<") {
+      t[1] === "/" ? stack.pop() : stack.push(t);
+      cur += t;
+      continue;
+    }
+    const parts = t.split("\n");
+    parts.forEach((part, i) => {
+      if (i > 0) { lines.push(cur + "</span>".repeat(stack.length)); cur = stack.join(""); }
+      cur += part;
+    });
+  }
+  lines.push(cur + "</span>".repeat(stack.length));
+  while (lines.length < count) lines.push("");
+  return lines;
+}
+
+// ------------------------------------------------------------- repo picker
+
+async function openModal() {
+  $("modal").hidden = false;
+  $("modal-err").textContent = "";
+  const { recent, home } = await api("recent");
+  $("recent").innerHTML = recent.length ? "Recent: " + recent.map((p) => `<a data-path="${esc(p)}" title="${esc(p)}">${esc(p.replace(home, "~"))}</a>`).join("") : "";
+  const start = S.repo ? S.repo.root.replace(/\/[^/]+$/, "") || "/" : (recent[0] ? recent[0].replace(/\/[^/]+$/, "") : home);
+  await browse(start);
+  $("path-input").focus();
+}
+
+function closeModal() { if (S.repo) $("modal").hidden = true; }
+
+async function browse(path) {
+  const d = await api("ls", { path, hidden: $("opt-hidden").checked ? 1 : 0 });
+  S.modalPath = d.path; S.modalIsGit = d.is_git;
+  $("path-input").value = d.path;
+  $("modal-err").textContent = d.error || "";
+  const parts = d.path.split("/").filter(Boolean);
+  $("crumbs").innerHTML = `<a data-path="/">/</a>` + parts.map((p, i) => `<a data-path="/${esc(parts.slice(0, i + 1).join("/"))}">${esc(p)}</a>`).join(" / ") +
+    (d.is_git ? '<span class="git">git</span>' : "");
+  const items = [];
+  if (d.parent) items.push(`<div class="item" data-path="${esc(d.parent)}">📁 ..</div>`);
+  for (const e of d.entries) {
+    const full = (d.path === "/" ? "" : d.path) + "/" + e.name;
+    items.push(`<div class="item" data-path="${esc(full)}" data-git="${e.is_git ? 1 : ""}">📁 ${esc(e.name)}${e.is_git ? '<span class="git">git</span>' : ""}</div>`);
+  }
+  $("dirlist").innerHTML = items.join("") || '<div class="item muted">(no subdirectories)</div>';
+}
+
+async function chooseRepo(path) {
+  try {
+    await openRepo(path);
+    $("modal").hidden = true;
+  } catch (err) {
+    $("modal-err").textContent = err.message;
+  }
+}
+
+$("repo-btn").onclick = () => openModal().catch(showError);
+$("modal-cancel").onclick = closeModal;
+$("modal-open").onclick = () => chooseRepo(S.modalPath);
+$("opt-hidden").onchange = () => browse(S.modalPath);
+$("modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
+$("path-input").addEventListener("keydown", (e) => { if (e.key === "Enter") browse($("path-input").value).catch(showError); });
+$("crumbs").addEventListener("click", (e) => { const a = e.target.closest("a"); if (a) browse(a.dataset.path); });
+$("recent").addEventListener("click", (e) => { const a = e.target.closest("a"); if (a) chooseRepo(a.dataset.path); });
+$("dirlist").addEventListener("click", (e) => { const it = e.target.closest(".item[data-path]"); if (it) browse(it.dataset.path); });
+$("dirlist").addEventListener("dblclick", (e) => { const it = e.target.closest(".item[data-git='1']"); if (it) chooseRepo(it.dataset.path); });
+
+// ------------------------------------------------------------------ toggles
+
+function bindOpt(id, key, onChange) {
+  const el = $(id);
+  el.checked = opts[key];
+  el.addEventListener("change", () => { opts[key] = el.checked; saveOpts(); onChange?.(); });
+}
+
+const rerender = () => { if (S.view) renderDiff(S.view.d, S.l === S.r); };
+bindOpt("opt-word", "word", rerender);
+bindOpt("opt-lock", "lock");
+bindOpt("opt-deleted", "deleted", () => S.repo && loadFiles().catch(showError));
+bindOpt("opt-hl", "hl", () => {
+  setHlMedia();
+  if (opts.hl) loadHljs().then(rerender).catch(showError); else rerender();
+});
+
+function showError(err) {
+  console.error(err);
+  $("diff").innerHTML = `<div class="placeholder">Error: ${esc(err.message || String(err))}</div>`;
+}
+
+window.addEventListener("resize", () => { if (S.commits.length) renderBars(), update(); });
+
+// --------------------------------------------------------------------- boot
+
+async function boot() {
+  const want = readURL();
+  setHlMedia();
+  if (opts.hl) await loadHljs().catch(showError);
+  if (!want.repo) {
+    clearFileView();
+    return openModal();
+  }
+  if (!S.repo || S.repo.root !== want.repo) await openRepo(want.repo, false);
+  if (want.file) await selectFile(want.file, want, false);
+  else { S.file = null; S.commits = []; clearFileView(); renderTree(); }
+}
+
+boot().catch(showError);
+</script>
+</body>
+</html>
