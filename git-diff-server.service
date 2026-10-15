@@ -1,0 +1,9 @@
+[Unit]
+Description=git-diff-server: scrub through a file's git history in the browser
+
+[Service]
+ExecStart=%h/.local/bin/git-diff-server serve --port 7465
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
