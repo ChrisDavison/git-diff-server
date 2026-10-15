@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""Local web server for scrubbing through one file's git history as a diff.
+
+  git-diff-server serve [--port 7465]     run the server (what systemd runs)
+  git-diff-server open [PATH]             open PATH (file or directory) in the
+                                          browser, starting a server if needed
+
+The page lets you pick a repository, pick a file (optionally one that has been
+deleted), then move a left and right handle along the commits that touched it.
+
+No third-party dependencies; Python 3.8+.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from difflib import SequenceMatcher
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
+
+DEFAULT_PORT = 7465
+CONTEXT = 3
+LARGE_FILE_LINES = 50_000
+WORKTREE = "WORKTREE"
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "git-diff-server"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "git-diff-server"
+RECENT_FILE = STATE_DIR / "recent.json"
+MAX_RECENT = 10
+
+HLJS_VERSION = "11.11.1"
+HLJS_BASE = f"https://cdnjs.cloudflare.com/ajax/libs/highlight.js/{HLJS_VERSION}"
+VENDOR_FILES = {
+    "highlight.min.js": f"{HLJS_BASE}/highlight.min.js",
+    "github.min.css": f"{HLJS_BASE}/styles/github.min.css",
+    "github-dark.min.css": f"{HLJS_BASE}/styles/github-dark.min.css",
+}
+
+# Nearest-preceding-declaration patterns, used to label each change group.
+SECTION_PATTERNS = {
+    (".tex", ".latex"): r"^\s*\\(?:sub)*section\*?\{(.+?)\}",
+    (".md", ".markdown", ".mdx"): r"^\s{0,3}(#{1,6}\s+.+?)\s*#*\s*$",
+    (".py",): r"^\s*(?:async\s+)?(def\s+\w+|class\s+\w+)",
+    (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"): r"^\s*(?:export\s+)?(?:default\s+)?"
+    r"((?:async\s+)?function\s+\w+|class\s+\w+|const\s+\w+\s*=\s*(?:async\s*)?\()",
+    (".go",): r"^\s*(func\s+[\w\(\)\*\s]+|type\s+\w+)",
+    (".rs",): r"^\s*(?:pub\s+)?((?:async\s+)?fn\s+\w+|struct\s+\w+|impl\b.*|enum\s+\w+)",
+    (".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs"): r"^[A-Za-z_].*?\b(\w+)\s*\([^;]*\)\s*\{?\s*$",
+    (".yml", ".yaml"): r"^([A-Za-z_][\w\-]*):",
+    (".sh", ".bash"): r"^\s*(?:function\s+)?(\w+)\s*\(\)\s*\{",
+    (".ps1", ".psm1"): r"^\s*function\s+([\w\-]+)",
+}
+
+
+# --------------------------------------------------------------------------
+# git plumbing
+# --------------------------------------------------------------------------
+
+
+class GitError(RuntimeError):
+    pass
+
+
+def git_bytes(repo: Path, *args: str, ok_codes: tuple[int, ...] = (0,)) -> bytes:
+    proc = subprocess.run(
+        ["git", "-c", "core.quotepath=false", *args], cwd=str(repo), capture_output=True
+    )
+    if proc.returncode not in ok_codes:
+        raise GitError(proc.stderr.decode("utf-8", "replace").strip() or f"git {args[0]} failed")
+    return proc.stdout
+
+
+def git(repo: Path, *args: str, ok_codes: tuple[int, ...] = (0,)) -> str:
+    return git_bytes(repo, *args, ok_codes=ok_codes).decode("utf-8", "replace")
+
+
+def repo_root(path: Path) -> Path:
+    start = path if path.is_dir() else path.parent
+    try:
+        return Path(git(start, "rev-parse", "--show-toplevel").strip())
+    except (GitError, FileNotFoundError, NotADirectoryError):
+        raise GitError(f"{path} is not inside a git repository")
+
+
+def head_sha(repo: Path) -> str:
+    return git(repo, "rev-parse", "--verify", "-q", "HEAD", ok_codes=(0, 1)).strip()
+
+
+def is_binary(data: bytes) -> bool:
+    return b"\0" in data[:8000]
+
+
+def split_lines(data: bytes) -> list[str]:
+    text = data.decode("utf-8", "replace")
+    if not text:
+        return []
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return [ln[:-1] if ln.endswith("\r") else ln for ln in lines]
+
+
+def blob(repo: Path, rev: str, path: str) -> bytes | None:
+    """Raw file contents at a revision (or the working tree), None if absent."""
+    if rev == WORKTREE:
+        target = repo / path
+        return target.read_bytes() if target.is_file() else None
+    proc = subprocess.run(["git", "cat-file", "blob", f"{rev}:{path}"], cwd=str(repo), capture_output=True)
+    return proc.stdout if proc.returncode == 0 else None
+
+
+# Per-(repo, HEAD) caches; listing every file and deletion is the slow part.
+_cache: dict[tuple, object] = {}
+_cache_lock = threading.Lock()
+
+
+def cached(key: tuple, fn):
+    with _cache_lock:
+        if key in _cache:
+            return _cache[key]
+    value = fn()
+    with _cache_lock:
+        _cache[key] = value
+    return value
+
+
+def tracked_files(repo: Path, head: str) -> list[dict]:
+    """Files at HEAD, flagged binary/submodule so the UI can disable them."""
+
+    def build():
+        raw = git_bytes(repo, "ls-tree", "-r", "-l", "-z", "HEAD").decode("utf-8", "replace")
+        text = git_bytes(repo, "grep", "-I", "-l", "-z", "-e", "", "HEAD", ok_codes=(0, 1))
+        text_paths = {p.split(":", 1)[1] for p in text.decode("utf-8", "replace").split("\0") if p}
+        files = []
+        for entry in raw.split("\0"):
+            if not entry:
+                continue
+            meta, path = entry.split("\t", 1)
+            mode, kind, _sha, size = meta.split()
+            item = {"path": path}
+            if kind == "commit":
+                item["disabled"] = "submodule"
+            elif path not in text_paths and size != "0" and mode != "120000":
+                item["disabled"] = "binary"
+            files.append(item)
+        return files
+
+    return cached(("tracked", str(repo), head), build)
+
+
+def deleted_files(repo: Path, head: str) -> list[dict]:
+    """Paths deleted somewhere in HEAD's history and not present at HEAD."""
+
+    def build():
+        present = {f["path"] for f in tracked_files(repo, head)}
+        raw = git(
+            repo,
+            "log",
+            "--diff-filter=D",
+            "--numstat",
+            "--date=format:%Y-%m-%d",
+            "--format=\x01%H\x02%ad\x02%s",
+        )
+        out, seen = [], set()
+        sha = date = subject = ""
+        for line in raw.splitlines():
+            if line.startswith("\x01"):
+                sha, date, subject = line[1:].split("\x02", 2)
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) != 3 or " => " in parts[2]:
+                continue
+            path = parts[2]
+            if path in seen or path in present:
+                continue
+            seen.add(path)
+            item = {"path": path, "deleted": {"sha": sha, "date": date, "subject": subject}}
+            if parts[0] == "-":
+                item["disabled"] = "binary"
+            out.append(item)
+        return out
+
+    return cached(("deleted", str(repo), head), build)
+
+
+def file_history(repo: Path, path: str) -> dict:
+    """Commits touching ``path`` (following renames), oldest first."""
+    raw = git(
+        repo,
+        "log",
+        "--follow",
+        "--numstat",
+        "-z",
+        "--date=format:%Y-%m-%d %H:%M",
+        "--format=\x01%H\x02%h\x02%ad\x02%an\x02%B\x03",
+        "--",
+        path,
+    )
+    commits = []
+    current_path = path
+    for chunk in raw.split("\x01"):
+        if not chunk:
+            continue
+        header, _, rest = chunk.partition("\x03")
+        sha, short, date, author, message = header.split("\x02", 4)
+        tokens = rest.lstrip("\0\n").split("\0")
+        added = deleted = 0
+        binary = False
+        commit_path, older_path = current_path, current_path
+        if tokens and tokens[0]:
+            a, d, p = tokens[0].split("\t", 2)
+            binary = a == "-"
+            added, deleted = (0, 0) if binary else (int(a), int(d))
+            if p == "" and len(tokens) >= 3:  # rename: old, new
+                older_path, commit_path = tokens[1], tokens[2]
+            elif p:
+                commit_path = older_path = p
+        message = message.strip("\n")
+        commits.append(
+            {
+                "sha": sha,
+                "short": short,
+                "date": date,
+                "author": author,
+                "subject": message.split("\n", 1)[0],
+                "message": message,
+                "path": commit_path,
+                "add": added,
+                "del": deleted,
+                "binary": binary,
+            }
+        )
+        current_path = older_path
+
+    commits.reverse()
+    deleted_in = None
+    # A deleted file's newest commit is the deletion itself: drop it so the
+    # timeline ends at the last version that existed.
+    if commits and blob(repo, commits[-1]["sha"], commits[-1]["path"]) is None:
+        deleted_in = commits.pop()
+        deleted_in = {k: deleted_in[k] for k in ("sha", "short", "date", "subject")}
+
+    worktree = None
+    target = repo / path
+    if deleted_in is None and target.is_file():
+        dirty = subprocess.run(
+            ["git", "diff", "--quiet", "HEAD", "--", path], cwd=str(repo)
+        ).returncode != 0
+        if dirty or not commits:
+            data = target.read_bytes()
+            stat = git(repo, "diff", "--numstat", "HEAD", "--", path).split("\t")
+            if not commits:
+                stat = [str(len(split_lines(data))), "0"]
+            worktree = {
+                "sha": WORKTREE,
+                "short": "worktree",
+                "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(target.stat().st_mtime)),
+                "author": "",
+                "subject": "uncommitted changes",
+                "message": "uncommitted changes in the working tree",
+                "path": path,
+                "add": int(stat[0]) if stat[0].isdigit() else 0,
+                "del": int(stat[1]) if len(stat) > 1 and stat[1].isdigit() else 0,
+                "binary": is_binary(data),
+            }
+            commits.append(worktree)
+
+    return {"path": path, "commits": commits, "deleted": deleted_in}
+
+
+# --------------------------------------------------------------------------
+# diff building
+# --------------------------------------------------------------------------
+
+
+def section_regex(path: str):
+    ext = Path(path).suffix.lower()
+    for exts, pattern in SECTION_PATTERNS.items():
+        if ext in exts:
+            return re.compile(pattern)
+    return None
+
+
+def section_map(lines: list[str], rx) -> list[str]:
+    out, cur = [], ""
+    for ln in lines:
+        if rx:
+            m = rx.match(ln)
+            if m:
+                cur = re.sub(r"\\[a-zA-Z]+\{?|[{}]|^#+\s*", "", m.group(1)).strip()
+        out.append(cur)
+    return out
+
+
+def word_ranges(a: str, b: str) -> tuple[list, list]:
+    """Character ranges that differ between two similar lines."""
+    wa, wb = re.split(r"(\s+)", a), re.split(r"(\s+)", b)
+    sm = SequenceMatcher(None, wa, wb, autojunk=False)
+    ra, rb, pa, pb = [], [], 0, 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        la = sum(len(w) for w in wa[i1:i2])
+        lb = sum(len(w) for w in wb[j1:j2])
+        if tag != "equal":
+            if la:
+                ra.append([pa, pa + la])
+            if lb:
+                rb.append([pb, pb + lb])
+        pa += la
+        pb += lb
+    return ra, rb
+
+
+EQ, CHG, DEL, INS = 0, 1, 2, 3
+
+
+def build_diff(left: list[str], right: list[str], sections: list[str]) -> dict:
+    """Every row of a side-by-side diff; the page collapses unchanged runs.
+
+    Row: [kind, left_no, right_no, left_text, right_text, left_ranges, right_ranges]
+    Group: [first_row, label, added, deleted]
+    """
+    rows: list[list] = []
+    groups: list[list] = []
+    sm = SequenceMatcher(None, left, right, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                rows.append([EQ, i1 + k + 1, j1 + k + 1, left[i1 + k], right[j1 + k], None, None])
+            continue
+        start = len(rows)
+        # Replaced lines share rows side by side; word ranges only when similar.
+        paired = min(i2 - i1, j2 - j1)
+        for k in range(paired):
+            a, b = left[i1 + k], right[j1 + k]
+            ra = rb = None
+            if a.strip() and b.strip() and SequenceMatcher(None, a, b).ratio() > 0.35:
+                ra, rb = word_ranges(a, b)
+            rows.append([CHG, i1 + k + 1, j1 + k + 1, a, b, ra, rb])
+        for ai in range(i1 + paired, i2):
+            rows.append([DEL, ai + 1, None, left[ai], None, None, None])
+        for bi in range(j1 + paired, j2):
+            rows.append([INS, None, bi + 1, None, right[bi], None, None])
+        label = sections[j1] if j1 < len(sections) else (sections[-1] if sections else "")
+        groups.append([start, label or f"line {j1 + 1}", j2 - j1, i2 - i1])
+    return {
+        "rows": rows,
+        "groups": groups,
+        "add": sum(g[2] for g in groups),
+        "del": sum(g[3] for g in groups),
+    }
+
+
+def diff_payload(repo: Path, lrev: str, lpath: str, rrev: str, rpath: str, force: bool) -> dict:
+    ldata, rdata = blob(repo, lrev, lpath), blob(repo, rrev, rpath)
+    result = {"labsent": ldata is None, "rabsent": rdata is None}
+    lbin, rbin = is_binary(ldata or b""), is_binary(rdata or b"")
+    if lbin or rbin:
+        result.update(lbinary=lbin, rbinary=rbin, lsize=len(ldata or b""), rsize=len(rdata or b""))
+        return result
+    left, right = split_lines(ldata or b""), split_lines(rdata or b"")
+    if not force and max(len(left), len(right)) > LARGE_FILE_LINES:
+        result.update(too_large=True, llines=len(left), rlines=len(right))
+        return result
+    rx = section_regex(rpath)
+    result.update(build_diff(left, right, section_map(right, rx)))
+    return result
+
+
+# --------------------------------------------------------------------------
+# directory browsing and recent repos
+# --------------------------------------------------------------------------
+
+
+def list_dir(raw: str, show_hidden: bool) -> dict:
+    path = Path(os.path.expanduser(raw or "~")).resolve()
+    out = {"path": str(path), "parent": str(path.parent) if path != path.parent else None,
+           "home": str(Path.home()), "is_git": (path / ".git").exists(), "entries": []}
+    try:
+        children = sorted(path.iterdir(), key=lambda p: p.name.lower())
+    except FileNotFoundError:
+        out["error"] = "no such directory"
+        return out
+    except NotADirectoryError:
+        out["error"] = "not a directory"
+        return out
+    except PermissionError:
+        out["error"] = "permission denied"
+        return out
+    for child in children:
+        if child.name.startswith(".") and not show_hidden:
+            continue
+        try:
+            if not child.is_dir():
+                continue
+            is_git = (child / ".git").exists()
+        except OSError:
+            continue
+        out["entries"].append({"name": child.name, "is_git": is_git})
+    return out
+
+
+def load_recent() -> list[str]:
+    try:
+        return [p for p in json.loads(RECENT_FILE.read_text()) if isinstance(p, str)]
+    except (OSError, ValueError):
+        return []
+
+
+def remember_repo(root: Path) -> None:
+    recent = [str(root)] + [p for p in load_recent() if p != str(root)]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    RECENT_FILE.write_text(json.dumps(recent[:MAX_RECENT], indent=1))
+
+
+def vendor_file(name: str) -> bytes:
+    """highlight.js assets, downloaded once and then served from the cache."""
+    target = CACHE_DIR / name
+    if not target.exists():
+        with urllib.request.urlopen(VENDOR_FILES[name], timeout=20) as resp:
+            data = resp.read()
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(target)
+    return target.read_bytes()
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "git-diff-server"
+    allowed_hosts: set[str] = set()
+
+    def log_message(self, fmt, *args):  # quiet unless something fails
+        if args and str(args[1]).startswith(("4", "5")):
+            super().log_message(fmt, *args)
+
+    def send(self, status: int, body: bytes, ctype: str, cache: bool = False) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=86400" if cache else "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, data, status: int = 200) -> None:
+        self.send(status, json.dumps(data, separators=(",", ":")).encode(), "application/json")
+
+    def do_GET(self):
+        # Refuse anything not addressed to localhost, so a web page cannot use
+        # DNS rebinding to read files through this server.
+        if self.headers.get("Host", "") not in self.allowed_hosts:
+            self.send(HTTPStatus.FORBIDDEN, b"forbidden host", "text/plain")
+            return
+        url = urlsplit(self.path)
+        q = {k: v[-1] for k, v in parse_qs(url.query).items()}
+        try:
+            if url.path == "/":
+                body = (STATIC_DIR / "index.html").read_bytes()
+                self.send(200, body, "text/html; charset=utf-8")
+            elif url.path.startswith("/vendor/"):
+                name = url.path.rsplit("/", 1)[1]
+                if name not in VENDOR_FILES:
+                    self.send(404, b"not found", "text/plain")
+                    return
+                ctype = "text/javascript" if name.endswith(".js") else "text/css"
+                self.send(200, vendor_file(name), ctype, cache=True)
+            elif url.path.startswith("/api/"):
+                self.api(url.path[5:], q)
+            else:
+                self.send(404, b"not found", "text/plain")
+        except GitError as exc:
+            self.send_json({"error": str(exc)}, 400)
+        except (urllib.error.URLError, OSError) as exc:
+            self.send_json({"error": str(exc)}, 500)
+
+    def api(self, name: str, q: dict) -> None:
+        if name == "ping":
+            self.send_json({"ok": True, "app": "git-diff-server"})
+        elif name == "ls":
+            self.send_json(list_dir(q.get("path", ""), q.get("hidden") == "1"))
+        elif name == "recent":
+            self.send_json({"recent": [p for p in load_recent() if Path(p).is_dir()], "home": str(Path.home())})
+        elif name == "repo":
+            root = repo_root(Path(os.path.expanduser(q["path"])).resolve())
+            remember_repo(root)
+            branch = git(root, "branch", "--show-current").strip()
+            self.send_json({"root": str(root), "name": root.name, "branch": branch, "head": head_sha(root)})
+        elif name == "files":
+            root = repo_root(Path(q["repo"]))
+            head = head_sha(root)
+            if not head:
+                self.send_json({"files": [], "error": "repository has no commits"})
+                return
+            files = list(tracked_files(root, head))
+            if q.get("deleted") == "1":
+                files += deleted_files(root, head)
+            self.send_json({"files": files})
+        elif name == "history":
+            root = repo_root(Path(q["repo"]))
+            self.send_json(file_history(root, q["file"]))
+        elif name == "diff":
+            root = repo_root(Path(q["repo"]))
+            self.send_json(
+                diff_payload(root, q["l"], q["lpath"], q["r"], q["rpath"], q.get("force") == "1")
+            )
+        else:
+            self.send_json({"error": f"unknown endpoint {name}"}, 404)
+
+
+def make_server(host: str, port: int) -> ThreadingHTTPServer:
+    Handler.allowed_hosts = {f"{h}:{port}" for h in ("127.0.0.1", "localhost", "[::1]")}
+    ThreadingHTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.daemon_threads = True
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def server_running(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=0.5) as resp:
+            return json.load(resp).get("app") == "git-diff-server"
+    except (OSError, ValueError):
+        return False
+
+
+def page_url(port: int, target: Path | None) -> str:
+    params = {}
+    if target is not None:
+        try:
+            root = repo_root(target)
+        except GitError as exc:
+            print(f"note: {exc}; opening the repository picker", file=sys.stderr)
+        else:
+            params["repo"] = str(root)
+            if target.is_file() or not target.exists():
+                params["file"] = target.relative_to(root).as_posix()
+    query = urlencode(params, quote_via=quote, safe="/")
+    return f"http://localhost:{port}/" + (f"?{query}" if query else "")
+
+
+def cmd_serve(args) -> int:
+    server = make_server(args.host, args.port)
+    print(f"git-diff-server listening on http://localhost:{args.port}/", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_open(args) -> int:
+    target = Path(args.path).resolve() if args.path else Path.cwd()
+    url = page_url(args.port, target)
+    if server_running(args.port):
+        webbrowser.open(url)
+        print(url)
+        return 0
+    server = make_server("127.0.0.1", args.port)
+    print(f"no server on port {args.port}; serving here until Ctrl-C\n{url}", flush=True)
+    threading.Timer(0.3, webbrowser.open, (url,)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command")
+    s = sub.add_parser("serve", help="run the server")
+    s.add_argument("--port", type=int, default=DEFAULT_PORT)
+    s.add_argument("--host", default="127.0.0.1")
+    o = sub.add_parser("open", help="open a file or repo in the browser")
+    o.add_argument("path", nargs="?", help="file or directory (default: current directory)")
+    o.add_argument("--port", type=int, default=DEFAULT_PORT)
+    args = p.parse_args(argv)
+    if args.command == "serve":
+        return cmd_serve(args)
+    if args.command is None:
+        args = p.parse_args(["open"])
+    return cmd_open(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
