@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local web server for scrubbing through one file's git history as a diff.
 
-  git-diff-server serve [--port 7465]     run the server (what systemd runs)
+  git-diff-server serve [--port 7465]     run the server (what the service runs)
   git-diff-server open [PATH]             open PATH (file or directory) in the
                                           browser, starting a server if needed
 

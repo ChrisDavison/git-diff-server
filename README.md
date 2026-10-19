@@ -13,14 +13,42 @@ Python 3.8+ standard library only; no build step.
 ./install.sh
 ```
 
-This links `git-diff-server` into `~/.local/bin/`, links the systemd user unit
-into `~/.config/systemd/user/`, then enables and (re)starts it. The server
-listens on <http://localhost:7465/>. Re-run it after pulling changes.
+This links `git-diff-server` into `~/.local/bin/`, then registers it as a
+background service that starts at login and restarts if it crashes: a launchd
+agent on macOS, a systemd user unit on Linux. The server listens on
+<http://localhost:7465/>. Re-run it after pulling changes.
+
+```sh
+./install.sh --uninstall    # stop and remove the service and the link
+./install.sh --no-service   # only link the script onto PATH
+```
+
+On other systems, or without a systemd user session, `install.sh` only links
+the script; run `git-diff-server serve` under whatever supervisor you use.
+
+### macOS (launchd)
+
+`install.sh` writes `~/Library/LaunchAgents/local.git-diff-server.plist`.
+launchd starts agents with a bare `PATH`, so the plist pins the `python3` and
+`git` that were on your `PATH` at install time. Re-run `install.sh` if you
+change either.
+
+```sh
+launchctl print gui/$(id -u)/local.git-diff-server     # status
+tail -f ~/Library/Logs/git-diff-server.log             # logs
+launchctl kickstart -k gui/$(id -u)/local.git-diff-server   # restart
+```
+
+Repositories under `~/Documents`, `~/Desktop` or `~/Downloads` are protected
+by macOS privacy controls. The background service can't read them until you
+grant your `python3` access in System Settings › Privacy & Security ›
+Files and Folders (or Full Disk Access).
+
+### Linux (systemd)
 
 ```sh
 systemctl --user status git-diff-server
 journalctl --user -u git-diff-server -f
-systemctl --user disable --now git-diff-server   # stop using the service
 ```
 
 ## Run manually
@@ -72,6 +100,6 @@ bookmarks work.
 | `git-diff-server` | server and CLI |
 | `static/index.html` | the page |
 | `git-diff-server.service` | systemd user unit |
-| `install.sh` | links the script and unit, enables the service |
+| `install.sh` | links the script, installs the launchd agent or systemd unit |
 
 State lives in `~/.local/state/git-diff-server/recent.json`.
